@@ -2,7 +2,8 @@ langchain
 langgraph
 langchain-groq
 langchain-openai
-dotenv
+python-dotenv
 pydantic
 langgraph-checkpoint-sqlite
 sqlalchemy
+streamlit
