@@ -2,7 +2,7 @@
 
 An agentic email assistant built with LangGraph and Streamlit. You describe what you want to send and to whom — the AI drafts it, you review it, tweak it if needed, and send it directly from your Gmail.
 
-**Live demo → [email-agent-01.streamlit.app](https://email-agent-01.streamlit.app/)**
+## **Live demo → [email-agent-01.streamlit.app](https://email-agent-01.streamlit.app/)**
 
 ---
 
