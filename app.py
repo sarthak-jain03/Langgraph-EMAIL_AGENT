@@ -12,6 +12,7 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 from typing import Literal
 from send_email import send_mail
+from document_extractor import extract_text_from_files
 
 
 st.set_page_config(
@@ -197,13 +198,13 @@ def get_llm():
 
 class EmailState(BaseModel):
     question: str = ""
+    document_context: str = ""
     mail_reason: str = ""
     recipient_name: str = ""
     recipient_email: str = ""
     subject: str = ""
     body: str = ""
     feedback: str = ""
-    feedback_count: int = 0
     response: str = ""
 
 
@@ -221,11 +222,22 @@ class DraftEmail(BaseModel):
 def retriever_node(state: EmailState) -> EmailState:
     llm = get_llm()
     llm_for_userdetails = llm.with_structured_output(UserDetails)
+
+    doc_section = ""
+    if state.document_context:
+        preview = state.document_context[:4000]
+        doc_section = (
+            "\n\nThe user has also attached the following document(s). "
+            "Use them to extract the recipient email / name if not explicitly stated in the query:\n"
+            f"{preview}"
+        )
+
     prompt = (
         "Extract the user details for sending an email. "
         "You MUST respond by calling the provided tool to output the structured data. "
         "If the query is empty or missing information, output empty strings for those fields.\n\n"
         f"Query: {state.question}"
+        f"{doc_section}"
     )
     userDetails: UserDetails = llm_for_userdetails.invoke(prompt)
     state.recipient_name = userDetails.recipient_name
@@ -238,13 +250,27 @@ def draft_node(state: EmailState) -> EmailState:
     llm = get_llm()
     draft_email_llm = llm.with_structured_output(DraftEmail)
 
+    doc_section = ""
+    if state.document_context:
+        preview = state.document_context[:6000]
+        doc_section = (
+            "\n\n--- Attached Document Context ---\n"
+            "The user has provided the following document(s). Use the information contained "
+            "within them to personalise the email. For example, if a resume is attached, "
+            "highlight relevant skills, experience and qualifications; if a job posting is "
+            "attached, tailor the email to the role requirements.\n"
+            f"{preview}\n"
+            "--- End of Document Context ---"
+        )
+
     if state.feedback:
         prompt = f"""
             Revise this email based on the feedback below:
-            Current email: 
+            Current email:
             Subject: {state.subject}
             Body: {state.body}
             Feedback: {state.feedback}
+            {doc_section}
 
             Please write a proper email body and subject without extra text and improvement based on the feedback.
             The max size of the mail body should be 200 words.
@@ -254,8 +280,11 @@ def draft_node(state: EmailState) -> EmailState:
             Write an email with these details:
             To: {state.recipient_name}
             Request: {state.mail_reason}
+            {doc_section}
 
-            Please write a proper mail body and subject without extra text.
+            Please write a proper, personalised email body and subject without extra text.
+            If document context is provided, tailor the email accordingly (e.g. highlight
+            matching skills from a resume for a job application).
             The maximum size of the mail body is 200 words.
         """
 
@@ -273,28 +302,21 @@ def review_node(state: EmailState) -> EmailState:
         state.feedback = ""
     else:
         state.feedback = response
-        state.feedback_count = state.feedback_count + 1
     return state
 
 
-def router(state: EmailState) -> Literal["draft", "send", "cancel"]:
+def router(state: EmailState) -> Literal["draft", "send"]:
     if not state.feedback or state.feedback.strip() == "":
         return "send"
-    if state.feedback_count > 2:
-        return "cancel"
     return "draft"
-
-
-def cancel_node(state: EmailState) -> EmailState:
-    state.response = "Email not sent. You have already reached the maximum limit of feedback!"
-    return state
 
 
 def send_node(state: EmailState) -> EmailState:
     """Send Final Email using the user's credentials from session state."""
     sender_email = st.session_state.get("sender_email", "")
     sender_password = st.session_state.get("sender_password", "")
-    res = send_mail(state.recipient_email, state.subject, state.body, sender_email, sender_password)
+    attachments = st.session_state.get("attachments", None)
+    res = send_mail(state.recipient_email, state.subject, state.body, sender_email, sender_password, attachments)
     state.response = res
     return state
 
@@ -305,7 +327,6 @@ def build_graph():
     graph.add_node("retriever", retriever_node)
     graph.add_node("draft", draft_node)
     graph.add_node("review", review_node)
-    graph.add_node("cancel", cancel_node)
     graph.add_node("send", send_node)
 
     graph.add_edge(START, "retriever")
@@ -313,7 +334,6 @@ def build_graph():
     graph.add_edge("draft", "review")
     graph.add_conditional_edges("review", router)
     graph.add_edge("send", END)
-    graph.add_edge("cancel", END)
 
     return graph.compile(checkpointer=InMemorySaver())
 
@@ -337,6 +357,12 @@ if "final_result" not in st.session_state:
 if "extracted_details" not in st.session_state:
     st.session_state.extracted_details = None
 
+if "attachments" not in st.session_state:
+    st.session_state.attachments = None
+
+if "document_context" not in st.session_state:
+    st.session_state.document_context = ""
+
 if "credentials_saved" not in st.session_state:
     st.session_state.credentials_saved = False
 
@@ -351,6 +377,8 @@ def reset_session():
     st.session_state.current_draft = None
     st.session_state.final_result = None
     st.session_state.extracted_details = None
+    st.session_state.attachments = None
+    st.session_state.document_context = ""
 
 
 
@@ -442,7 +470,7 @@ with st.sidebar:
     st.markdown("""
     1. **Connect** – Enter your Gmail & App Password
     2. **Compose** – Describe your email in natural language
-    3. **Review** – Approve or revise the AI draft (up to 3×)
+    3. **Review** – Approve or revise the AI draft (unlimited revisions)
     4. **Send** – Email is sent from your Gmail account
     """)
 
@@ -489,19 +517,39 @@ if st.session_state.stage == "input":
         unsafe_allow_html=True,
     )
 
-    with st.form("email_form", clear_on_submit=True):
+    with st.form("email_form", clear_on_submit=False):
         query = st.text_area(
             "Your request",
             placeholder='e.g. "Send an email to John (john@example.com) asking for a meeting next Monday at 3 PM"',
             height=120,
             label_visibility="collapsed",
         )
+
+        uploaded_files = st.file_uploader(
+            "📎 Attach documents (optional)",
+            accept_multiple_files=True,
+            help="Attach one or more files to be sent along with the email (PDF, DOCX, images, etc.)",
+            key="compose_attachments",
+        )
+
         submitted = st.form_submit_button("🚀 Generate Draft", use_container_width=True)
 
     if submitted and query.strip():
+        
+        st.session_state.attachments = uploaded_files if uploaded_files else None
+
+        doc_context = ""
+        if uploaded_files:
+            with st.spinner("📄 Reading attached documents..."):
+                doc_context = extract_text_from_files(uploaded_files)
+        st.session_state.document_context = doc_context
+
         with st.spinner("🤖 Extracting details & drafting your email..."):
             config = get_config()
-            res = final_graph.invoke({"question": query}, config=config)
+            res = final_graph.invoke(
+                {"question": query, "document_context": doc_context},
+                config=config,
+            )
 
         state = final_graph.get_state(config)
         if state.next:
@@ -530,7 +578,7 @@ elif st.session_state.stage == "review":
     draft = st.session_state.current_draft
     details = st.session_state.extracted_details
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.markdown(
             f'<span class="status-badge status-info">📧 {details["to"]}</span>',
@@ -542,11 +590,18 @@ elif st.session_state.stage == "review":
                 f'<span class="status-badge status-info">👤 {details["name"]}</span>',
                 unsafe_allow_html=True,
             )
-    with col3:
-        feedback_count = final_graph.get_state(get_config()).values.get("feedback_count", 0)
-        remaining = max(0, 3 - feedback_count)
+
+    attachments = st.session_state.get("attachments")
+    doc_context = st.session_state.get("document_context", "")
+    if attachments:
+        attachment_names = ", ".join(f.name for f in attachments)
         st.markdown(
-            f'<span class="status-badge status-warning">🔄 {remaining} revisions left</span>',
+            f'<span class="status-badge status-warning">📎 {len(attachments)} attachment(s): {attachment_names}</span>',
+            unsafe_allow_html=True,
+        )
+    if doc_context:
+        st.markdown(
+            '<span class="status-badge status-success">🧠 AI context loaded from document(s)</span>',
             unsafe_allow_html=True,
         )
 

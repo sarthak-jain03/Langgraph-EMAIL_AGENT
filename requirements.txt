@@ -7,3 +7,5 @@ pydantic
 langgraph-checkpoint-sqlite
 sqlalchemy
 streamlit
+pypdf
+python-docx
